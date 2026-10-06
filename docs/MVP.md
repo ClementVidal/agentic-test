@@ -420,6 +420,28 @@ Le livrable est un tableau dans `docs/benchmark.md` et un choix argumenté.
 
 ---
 
+## 10. Décisions à prendre par le porteur du projet
+
+| # | Question | Proposition par défaut |
+|---|---|---|
+| 1 | Nom du produit (et donc préfixes `agentic`, `agt_`) | provisoire, à choisir avant publication de l'Action |
+| 2 | Licence du runner | MIT ou Apache-2.0 (adoption max) ; le control plane reste fermé |
+| 3 | Cible prioritaire | agences web (plusieurs projets clients, staging souvent derrière auth, sensibles au coût) — à confirmer par les entretiens |
+| 4 | Paiement | merchant of record (Paddle / Lemon Squeezy) pour la TVA UE en solo |
+| 5 | Hébergement | VPS si à l'aise avec l'ops, sinon Vercel + Postgres managé |
+
+---
+
+## 11. Prochaines actions concrètes
+
+1. Initialiser le monorepo (pnpm, TS, lint, tests) avec `@agentic/scenario` (schéma Zod + tests).
+2. Écrire les 3 scénarios de benchmark dans le format ci-dessus (ils servent de premiers fixtures).
+3. Implémenter `driver-playwright-mcp` (avec sa boucle), `driver-stagehand` et `driver-midscene` + un `runner-core` minimal → lancer le benchmark.
+4. Choisir la lib, puis construire `report-html` et la GitHub Action (J0).
+5. En parallèle : landing page + premiers entretiens.
+
+---
+
 ## 12. Après le MVP : diagnostic et correctif automatique en cas d'échec
 
 Idée : quand un test échoue, proposer une **analyse du code** qui explique la cause
@@ -503,25 +525,3 @@ Prévu **après J2**. Le niveau 1 (diagnostic) est assez simple pour être avanc
 entretiens montrent que c'est un argument d'achat : il ferait une très bonne démo
 (« le test échoue, et voici pourquoi, ligne 42 »). Ce qu'il faut faire **dès J0** :
 capturer les `page_signals` et le contexte git dans `report.json` (§3).
-
----
-
-## 10. Décisions à prendre par le porteur du projet
-
-| # | Question | Proposition par défaut |
-|---|---|---|
-| 1 | Nom du produit (et donc préfixes `agentic`, `agt_`) | provisoire, à choisir avant publication de l'Action |
-| 2 | Licence du runner | MIT ou Apache-2.0 (adoption max) ; le control plane reste fermé |
-| 3 | Cible prioritaire | agences web (plusieurs projets clients, staging souvent derrière auth, sensibles au coût) — à confirmer par les entretiens |
-| 4 | Paiement | merchant of record (Paddle / Lemon Squeezy) pour la TVA UE en solo |
-| 5 | Hébergement | VPS si à l'aise avec l'ops, sinon Vercel + Postgres managé |
-
----
-
-## 11. Prochaines actions concrètes
-
-1. Initialiser le monorepo (pnpm, TS, lint, tests) avec `@agentic/scenario` (schéma Zod + tests).
-2. Écrire les 3 scénarios de benchmark dans le format ci-dessus (ils servent de premiers fixtures).
-3. Implémenter `driver-playwright-mcp` (avec sa boucle), `driver-stagehand` et `driver-midscene` + un `runner-core` minimal → lancer le benchmark.
-4. Choisir la lib, puis construire `report-html` et la GitHub Action (J0).
-5. En parallèle : landing page + premiers entretiens.
