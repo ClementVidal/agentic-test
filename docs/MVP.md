@@ -37,8 +37,7 @@ Le périmètre MVP du brief (§7) = **J0 + J1 + J2**. J0 seul est le « jalon z�
 
 ### Hors MVP (confirmé)
 Cache/replay sans LLM, détection de flaky, runner Docker générique, GitLab CI,
-runners managés, export vers bucket client, outils e-mail et double authentification
-(J1–J2, §4), outils définis par le client, **diagnostic et correctif automatique
+runners managés, export vers bucket client, outils définis par le client, **diagnostic et correctif automatique
 en cas d'échec** (§12). Mais **le format de rapport doit déjà contenir ce qu'il faudra
 pour ces fonctions** (actions résolues par étape, historique par scénario, erreurs
 console et réseau) — voir §3.
