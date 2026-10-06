@@ -13,7 +13,7 @@
 
 1. On commence par le **jalon zéro** : une GitHub Action open source, autonome, sans SaaS.
 2. Les scénarios sont des **fichiers YAML dans le repo du client** (versioning et revue de PR gratuits).
-3. Le runner est en **TypeScript** (même langage que le control plane) → benchmark **Stagehand vs Midscene**, browser-use écarté du MVP (Python).
+3. Le runner est en **TypeScript** (même langage que le control plane) → benchmark de 3 options : **Playwright MCP + notre propre boucle d'agent**, **Stagehand**, **Midscene** ; browser-use écarté du MVP (Python).
 4. Le code agent est caché derrière une interface `AgentDriver` : changer de lib ne doit toucher qu'un fichier.
 5. Secrets de l'app cible et clé LLM : **uniquement dans les secrets GitHub du client**. Les secrets ne sont jamais envoyés au LLM (substitution au moment de l'action).
 6. Verdicts à trois valeurs : `passed` / `failed` (l'app est KO) / `error` (l'agent ou l'infra est KO). C'est la distinction qui économise le support.
@@ -172,7 +172,7 @@ Points importants :
 @agentic/scenario      schéma Zod + parseur YAML + résolution des variables   (partagé runner/SaaS)
 @agentic/runner-core   orchestration : charge les scénarios, lance Playwright,
                        appelle l'AgentDriver, juge les expect, écrit report.json
-@agentic/driver-*      adaptateurs : driver-stagehand, driver-midscene
+@agentic/driver-*      adaptateurs : driver-playwright-mcp (boucle maison), driver-stagehand, driver-midscene
 @agentic/report-html   report.json → rapport HTML statique autonome
 @agentic/cli           `agentic run` en local (sert aussi au debug support)
 github-action          wrapper : installe Chromium, appelle le CLI, upload artefacts, commente la PR
@@ -204,12 +204,15 @@ Le LLM voit `{{secrets.TEST_USER_PASSWORD}}` (ou un placeholder équivalent) ; l
 réelle n'est injectée qu'au moment où l'action `fill` est exécutée par Playwright.
 Stagehand propose un mécanisme de variables pour cela — **à vérifier** pour la version
 retenue et pour Midscene pendant le benchmark ; à défaut, on l'implémente dans le driver.
+Avec Playwright MCP, c'est forcément à nous : la boucle remplace le placeholder par la
+valeur juste avant d'exécuter l'outil `fill`, et masque la valeur dans tout ce qui revient au LLM.
 
 ### Multi-provider LLM
 
 Ne pas écrire de SDK maison. S'appuyer sur ce que supporte la lib d'agent retenue
 (Stagehand et Midscene acceptent plusieurs providers — **liste exacte à vérifier**),
-et utiliser le **Vercel AI SDK** pour l'appel `check` fait par `runner-core`.
+et utiliser le **Vercel AI SDK** pour l'appel `check` fait par `runner-core` ainsi que
+pour la boucle du driver Playwright MCP (le SDK sait consommer les outils d'un serveur MCP).
 Convention de config : `model: <provider>/<modèle>`, clé lue dans la variable d'env
 standard du provider (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `MISTRAL_API_KEY`, …).
 OpenRouter reste possible comme provider parmi d'autres, pas comme dépendance.
@@ -346,9 +349,31 @@ version de scénario, verdicts différents sur le même commit).
 
 ## 8. Benchmark des libs d'agent (J-1)
 
-**Candidats** : Stagehand et Midscene (TypeScript, au-dessus de Playwright).
+**Candidats** (tous TypeScript, au-dessus de Playwright) :
+
+| Option | Principe | Ce qu'on mesure en particulier |
+|---|---|---|
+| **Playwright MCP + boucle maison** (référence) | Le LLM reçoit les outils officiels de Playwright (cliquer, remplir, lire la page via l'arbre d'accessibilité) et décide lui-même de chaque action ; notre code fait tourner la boucle | Fiabilité « brute » d'un LLM avec les outils officiels ; coût en tokens (la structure de la page est renvoyée à chaque action) |
+| **Stagehand** | La lib reçoit une instruction et choisit elle-même l'action | Ce qu'apporte une couche plus intelligente (cache, auto-réparation) |
+| **Midscene** | Idem, approche par vision | Idem, et intérêt de la vision vs l'arbre d'accessibilité |
+
+Pourquoi Playwright MCP sert de référence :
+- outil officiel de l'équipe Playwright → pas de dépendance à une startup ou à un éditeur tiers ;
+- fonctionne avec tout LLM qui sait appeler des outils → BYOK naturel ;
+- chaque décision et chaque action sont visibles → rapports et diagnostic plus clairs ;
+- c'est l'outil auquel les clients nous compareront (« Claude Code + Playwright MCP »).
+
+Ce qu'il faut écrire soi-même avec cette option : la boucle d'agent (conception à détailler), la
+gestion des secrets, et la récupération des actions effectuées pour le futur replay
+(Playwright MCP semble afficher le code Playwright équivalent à chaque action — **à vérifier**).
+À terme, on pourra aussi se passer du serveur MCP et appeler Playwright directement avec
+nos propres définitions d'outils ; MCP est juste le moyen le plus rapide de tester l'approche.
+
+**Règle de décision** : si Playwright MCP fait jeu égal en fiabilité et en coût, on le
+retient (moins de dépendances, plus de contrôle).
+
 browser-use (Python) est écarté du MVP pour ne pas avoir un runner dans un langage
-différent du reste ; à reconsidérer seulement si les deux autres échouent nettement.
+différent du reste ; à reconsidérer seulement si les trois options échouent nettement.
 
 **App cible** : une app de démo publique de type e-commerce (ex. SauceDemo) + une app
 de démo locale contrôlée (pour pouvoir **introduire volontairement des bugs** et vérifier
@@ -402,6 +427,6 @@ Le livrable est un tableau dans `docs/benchmark.md` et un choix argumenté.
 
 1. Initialiser le monorepo (pnpm, TS, lint, tests) avec `@agentic/scenario` (schéma Zod + tests).
 2. Écrire les 3 scénarios de benchmark dans le format ci-dessus (ils servent de premiers fixtures).
-3. Implémenter `driver-stagehand` et `driver-midscene` + un `runner-core` minimal → lancer le benchmark.
+3. Implémenter `driver-playwright-mcp` (avec sa boucle), `driver-stagehand` et `driver-midscene` + un `runner-core` minimal → lancer le benchmark.
 4. Choisir la lib, puis construire `report-html` et la GitHub Action (J0).
 5. En parallèle : landing page + premiers entretiens.
