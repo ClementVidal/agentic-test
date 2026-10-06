@@ -37,9 +37,10 @@ Le périmètre MVP du brief (§7) = **J0 + J1 + J2**. J0 seul est le « jalon z�
 
 ### Hors MVP (confirmé)
 Cache/replay sans LLM, détection de flaky, runner Docker générique, GitLab CI,
-runners managés, export vers bucket client. Mais **le format de rapport doit déjà
-contenir ce qu'il faudra pour le cache et le flaky** (actions résolues par étape,
-historique par scénario) — voir §3.
+runners managés, export vers bucket client, **diagnostic et correctif automatique
+en cas d'échec** (§12). Mais **le format de rapport doit déjà contenir ce qu'il faudra
+pour ces fonctions** (actions résolues par étape, historique par scénario, erreurs
+console et réseau) — voir §3.
 
 ---
 
@@ -147,6 +148,11 @@ du futur cache/replay et de la détection de flaky.
           "screenshot": "artifacts/checkout/expect-1.png" }
       ],
       "error": null,                          // rempli si status = error (timeout, crash, quota LLM…)
+      "page_signals": {                       // indices pour le futur diagnostic (§12)
+        "url_at_failure": "https://staging.example.com/cart",
+        "console_errors": ["TypeError: cannot read properties of undefined (reading 'price')"],
+        "failed_requests": [{ "method": "POST", "url": "/api/cart", "status": 500 }]
+      },
       "artifacts": { "video": "artifacts/checkout/video.webm", "trace": "artifacts/checkout/trace.zip" }
     }
   ]
@@ -161,6 +167,9 @@ Points importants :
   affichent les deux différemment ; seuls les `error` sont rejoués automatiquement.
 - Les valeurs de secrets sont **masquées** partout dans le rapport (texte, actions, logs).
 - `actions` + `content_hash` = de quoi faire du replay sans LLM plus tard sans changer le format.
+- `page_signals` (erreurs console, requêtes HTTP en échec, URL au moment de l'échec) :
+  peu coûteux à capturer avec Playwright, et c'est le meilleur indice pour remonter
+  d'un test en échec à une ligne de code (§12). À capturer dès J0.
 - `usage` = argument commercial (« voilà ce que vous coûte chaque test ») et base pour
   mesurer les économies du futur cache.
 
@@ -408,6 +417,92 @@ Le livrable est un tableau dans `docs/benchmark.md` et un choix argumenté.
 - Publication de l'Action J0 (Marketplace GitHub, Show HN, Reddit r/QualityAssurance / r/webdev, communautés FR).
 - 10 entretiens : agences web, PME avec app métier, freelances. Questions clés : comment testez-vous aujourd'hui ? qui écrit les tests ? combien paieriez-vous, 5–9 € ou 30–50 € ?
 - **Signal pour lancer J1** (proposition) : ≥ 50 stars ou ≥ 20 repos utilisant l'Action, ou ≥ 3 équipes qui demandent un historique/dashboard.
+
+---
+
+## 12. Après le MVP : diagnostic et correctif automatique en cas d'échec
+
+Idée : quand un test échoue, proposer une **analyse du code** qui explique la cause
+probable, puis, si l'utilisateur le demande, **une PR de correctif**.
+
+### Pourquoi c'est cohérent avec le modèle BYOK + BYO compute
+
+Le runner tourne déjà dans la CI du client, avec le code du repo sous la main
+(`actions/checkout`) et la clé LLM du client. L'analyse peut donc se faire **chez
+le client, sans que la plateforme voie jamais le code**. C'est un différenciateur fort
+face aux SaaS qui devraient demander l'accès au code.
+
+### Ne pas écrire notre propre agent de code
+
+Comme pour le navigateur, on s'appuie sur un agent de code existant, lancé dans la CI
+avec les mêmes contraintes multi-fournisseurs : par exemple un agent open source
+multi-fournisseurs (type OpenCode ou Aider), ou le Claude Agent SDK pour les
+utilisateurs de Claude. **Choix à faire par un mini-benchmark**, le jour venu. Notre
+valeur ajoutée est **le dossier d'enquête** qu'on lui fournit, pas l'agent.
+
+### Le dossier d'enquête fourni à l'agent de code
+
+1. Le scénario, l'étape en échec et la raison (`report.json`).
+2. Les `page_signals` : erreurs console, requêtes HTTP en échec, URL.
+3. Les captures avant/après l'échec.
+4. **Le diff de la PR testée** : quand le test passait sur la branche principale et
+   échoue sur la PR, la cause est presque toujours dans ce diff. C'est l'indice n°1.
+5. L'historique du scénario (il passait au commit X, échoue au commit Y).
+
+### Étape 1 : trier avant de corriger
+
+L'analyse commence par classer l'échec, car la bonne réponse n'est pas toujours
+« corriger le code » :
+
+| Cause | Exemple | Proposition |
+|---|---|---|
+| **Bug dans l'app** | Le total oublie la remise | Correctif du code |
+| **Test obsolète** (changement voulu) | Le bouton « Valider » s'appelle désormais « Payer » | **Mise à jour du scénario**, pas du code |
+| **Instabilité / agent perdu** | Rien dans le diff n'explique l'échec | Aucun correctif ; marquer comme suspect |
+| **Environnement** | Staging en panne, données de test absentes | Aucun correctif ; message clair |
+
+La deuxième ligne est très utile et peu risquée : c'est le premier correctif à proposer.
+
+### Déroulé en trois niveaux (à livrer dans cet ordre)
+
+1. **Diagnostic, en lecture seule.** Dans le commentaire de PR : la cause probable,
+   les fichiers et lignes suspects, un diff proposé **en texte**. Aucun droit
+   d'écriture nécessaire. Peu risqué, très démonstratif.
+2. **PR de correctif, à la demande.** L'utilisateur répond `/agentic fix` dans la PR ;
+   l'agent crée une branche et ouvre une PR **vers la branche de la PR en échec**
+   (jamais vers `main`, jamais en poussant directement sur la branche du développeur).
+3. **Correctif vérifié.** Le test qui échouait est relancé sur la PR de correctif ; le
+   commentaire indique si le correctif le fait passer.
+
+### Points techniques à ne pas oublier
+
+- **Vérifier un correctif suppose de pouvoir lancer l'app corrigée.** Si les tests
+  visent un staging fixe, le correctif ne peut pas être testé avant d'être déployé.
+  Ça marche bien si le client a des **environnements de prévisualisation par PR**
+  (Vercel, Netlify, Render…) ou si l'app peut être démarrée dans la CI (`base_url: http://localhost:3000`).
+  Sinon, s'arrêter au niveau 2 et le dire clairement.
+- **Limite GitHub** : une PR ouverte avec le `GITHUB_TOKEN` du workflow ne déclenche
+  pas de nouveau workflow. Pour que les tests tournent sur la PR de correctif (niveau 3),
+  il faudra une **App GitHub** (ou un token fourni par le client), ou un déclenchement
+  explicite par `workflow_dispatch`.
+- **Coût** : un agent de code consomme beaucoup plus de tokens qu'un test. Toujours
+  **activé explicitement** par l'utilisateur, avec un plafond configurable et le coût
+  affiché dans le commentaire.
+- **Sécurité** :
+  - job séparé du job de test, avec les **permissions minimales** (`contents: write` et
+    `pull-requests: write` seulement au niveau 2) et sans les secrets de l'app testée ;
+  - le contenu des pages testées est **non fiable** (texte saisi par des utilisateurs
+    sur le staging, par exemple) : il ne doit jamais pouvoir faire exécuter des
+    commandes à l'agent de code. On lui passe des données résumées, et on n'autorise
+    ni l'accès réseau libre ni le push sans action humaine ;
+  - désactivé par défaut sur les PR venant de forks.
+
+### Place dans la feuille de route
+
+Prévu **après J2**. Le niveau 1 (diagnostic) est assez simple pour être avancé si les
+entretiens montrent que c'est un argument d'achat : il ferait une très bonne démo
+(« le test échoue, et voici pourquoi, ligne 42 »). Ce qu'il faut faire **dès J0** :
+capturer les `page_signals` et le contexte git dans `report.json` (§3).
 
 ---
 
