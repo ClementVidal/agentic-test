@@ -16,7 +16,7 @@
 3. Le runner est en **TypeScript** (même langage que le control plane) → benchmark de 3 options : **Playwright MCP + notre propre boucle d'agent**, **Stagehand**, **Midscene** ; browser-use écarté du MVP (Python).
 4. Le code agent est caché derrière une interface `AgentDriver` : changer de lib ne doit toucher qu'un fichier.
 5. Secrets de l'app cible et clé LLM : **uniquement dans les secrets GitHub du client**. Les secrets ne sont jamais envoyés au LLM (substitution au moment de l'action).
-6. Verdicts à trois valeurs : `passed` / `failed` (l'app est KO) / `error` (l'agent ou l'infra est KO). C'est la distinction qui économise le support.
+6. Verdicts à quatre valeurs : `passed` / `failed` (l'app est KO, preuve à l'appui) / `inconclusive` (l'agent n'a pas abouti, sans preuve contre l'app) / `error` (l'outil ou l'infra est KO). C'est la distinction qui économise le support et préserve la confiance.
 7. Pour le MVP, le runner GitHub Action est **déclenché par la CI**, pas par polling → **pas de file de jobs** à construire au début.
 8. Le commentaire de PR est posté **par l'Action elle-même** avec le `GITHUB_TOKEN` → pas d'App GitHub à créer pour le MVP.
 9. Le SaaS (jalon 1) commence comme un **simple récepteur de rapports** : historique, captures, étape en échec.
@@ -94,16 +94,46 @@ expect:
   `{{secrets.X}}` (lues dans l'env du runner, jamais affichées, jamais envoyées au LLM).
 - Pas de `if`, pas de boucles, pas d'import en MVP. Un scénario = un parcours linéaire.
 
-### Fichier de config projet (optionnel)
+### Fichier de configuration : `agentic-test.ts`
 
-```yaml
-# .agentic/config.yaml
-base_url: https://staging.example.com
-model: anthropic/claude-sonnet-5-5   # format provider/modèle, la clé vient de l'env
-viewport: { width: 1280, height: 800 }
-retries: 1                           # rejouer un scénario en `error` (pas en `failed`)
-artifacts: { video: on-failure, trace: on-failure, screenshots: every-step }
+Un fichier TypeScript à la racine du repo du client, sur le modèle de `playwright.config.ts` :
+typé (autocomplétion dans l'éditeur), et capable de lire l'environnement
+(`process.env`) pour adapter la config à la branche ou à l'environnement visé.
+
+```ts
+// agentic-test.ts
+import { defineConfig } from "@agentic/cli";
+
+export default defineConfig({
+  baseUrl: process.env.STAGING_URL ?? "http://localhost:3000",
+  scenarios: ".agentic/scenarios/**/*.yaml",
+  model: "anthropic/claude-sonnet-5-5",        // format fournisseur/modèle ; la clé vient de l'env
+  viewport: { width: 1280, height: 800 },
+
+  agent: {
+    maxActionsPerStep: 15,                     // budget d'actions avant le bilan forcé
+  },
+
+  // Relances automatiques (jamais pour `failed`).
+  retries: {
+    inconclusive: 1,
+    error: 1,
+  },
+
+  // Quand la CI doit-elle échouer ? Comptage APRÈS relances.
+  ci: {
+    failOnFailed: true,                        // au moins un `failed` → CI rouge
+    inconclusiveThreshold: 1,                  // CI rouge à partir de N scénarios `inconclusive` ; false = jamais
+    errorThreshold: false,                     // idem pour `error` ; false = avertissement seulement
+  },
+
+  artifacts: { video: "on-failure", trace: "on-failure", screenshots: "every-step" },
+});
 ```
+
+Valeurs par défaut si le fichier est absent : celles ci-dessus (seul `baseUrl` doit
+alors être fourni, par l'Action). Le runner charge le fichier TypeScript sans étape de
+compilation côté client.
 
 ---
 
@@ -127,7 +157,7 @@ du futur cache/replay et de la détection de flaky.
     {
       "file": ".agentic/scenarios/checkout.yaml",
       "content_hash": "sha256:...",          // identifie la version du scénario
-      "status": "failed",                    // passed | failed | error | skipped
+      "status": "failed",                    // passed | failed | inconclusive | error | skipped
       "duration_ms": 48210,
       "attempt": 1,
       "usage": { "input_tokens": 51234, "output_tokens": 2310, "llm_calls": 14 },
@@ -161,10 +191,19 @@ du futur cache/replay et de la détection de flaky.
 
 Points importants :
 
-- **`failed` vs `error`** : `failed` = une étape n'a pas pu être réalisée *parce que l'app
-  ne le permet pas* ou une attente est fausse. `error` = problème côté outil (clé LLM
-  invalide, quota, timeout réseau, crash navigateur). Le rapport et le commentaire PR
-  affichent les deux différemment ; seuls les `error` sont rejoués automatiquement.
+- **Les quatre statuts d'échec possibles** :
+
+  | Situation | Statut | Relancé ? | Bloque la CI ? |
+  |---|---|---|---|
+  | Étape impossible, **preuve trouvée dans la page** | `failed` | non | oui (`ci.failOnFailed`) |
+  | Critère final jugé faux | `failed` | non | oui (`ci.failOnFailed`) |
+  | Agent bloqué, tourne en rond, ou preuve introuvable dans la page | `inconclusive` | `retries.inconclusive` | à partir de `ci.inconclusiveThreshold` |
+  | Clé invalide, quota, navigateur planté, site injoignable | `error` | `retries.error` | à partir de `ci.errorThreshold` |
+
+  `failed` dit « l'app est en cause, et voici la preuve ». `inconclusive` dit « l'agent
+  n'a pas réussi cette étape, sans pouvoir prouver que l'app est en cause ». Les
+  confondre produit soit de faux rouges (perte de confiance), soit des bugs cachés.
+  Le rapport et le commentaire PR les affichent différemment (rouge / orange / gris).
 - Les valeurs de secrets sont **masquées** partout dans le rapport (texte, actions, logs).
 - `actions` + `content_hash` = de quoi faire du replay sans LLM plus tard sans changer le format.
 - `page_signals` (erreurs console, requêtes HTTP en échec, URL au moment de l'échec) :
@@ -206,6 +245,73 @@ interface AgentDriver {
 `check` peut être implémenté une seule fois dans `runner-core` (appel LLM direct avec
 capture + texte de la page) plutôt que dans chaque driver : cela garantit des verdicts
 comparables quel que soit le driver.
+
+### Boucle d'agent (driver Playwright MCP)
+
+Pas de framework d'orchestration (LangGraph & co.) : un seul agent, un parcours
+linéaire, quelques minutes. Le Vercel AI SDK fournit les appels multi-fournisseurs et
+les appels d'outils ; la logique ci-dessous est notre code, parce que c'est là que se
+jouent le coût et la fiabilité.
+
+**1. Message reconstruit à chaque tour** (au lieu d'empiler la conversation) :
+
+```
+┌─ 1. Consignes + scénario complet          (identique à chaque tour)
+├─ 2. Journal des actions déjà faites        (une ligne ajoutée par action)
+│      Étape 1/4 ✓ Connexion — "connecté en tant que Marie"
+│      Étape 2/4 : clic "Rechercher" → champ rempli "T-shirt bleu" → page /search
+└─ 3. État ACTUEL de la page                 (seul bloc entièrement remplacé)
+      + « Étape en cours : 2/4 — Ouvrir la fiche produit. Quelle action ? »
+```
+
+- Une seule version de la page est envoyée, pas les 30 précédentes : le coût suit le
+  nombre d'actions au lieu d'exploser.
+- Les blocs 1 et 2 ne font que s'allonger : ils profitent de la mise en cache des
+  prompts des fournisseurs (tarif réduit sur un début de message déjà vu).
+- Le journal sert aussi de « fil des actions » dans le rapport.
+- C'est l'approche retenue par défaut ; le benchmark la compare à la conversation
+  complète pour **chiffrer le gain** et vérifier qu'elle ne dégrade pas la fiabilité (§8).
+
+**2. Outils donnés à l'IA** : ceux de Playwright MCP (cliquer, remplir, naviguer…), plus :
+- `regarder_ecran` : capture d'écran **à la demande** seulement (une image coûte cher) ;
+- `etape_reussie(resume)` : termine l'étape en cours ;
+- `etape_impossible(raison, preuve)` : déclare l'étape irréalisable, **en citant un
+  texte visible** dans la page (« Stock épuisé », « aucun bouton "Ajouter au panier" »).
+
+**3. Règles appliquées par la boucle, pas par l'IA** :
+- **Page stable avant lecture** : après chaque action, attendre la fin du chargement
+  avant de lire la page (sinon l'IA lit une page à moitié chargée : cause classique
+  d'instabilité).
+- **Preuve vérifiée** : sur `etape_impossible`, la boucle vérifie que le texte cité
+  existe dans la page. Trouvé → `failed`. Introuvable → `inconclusive`. Vérification
+  sans appel LLM, donc gratuite.
+- **Détection de boucle** : même action sur le même élément 3 fois, ou page inchangée
+  après 4 actions → on arrête l'étape sans attendre la fin du budget.
+- **Bilan forcé** : budget (`agent.maxActionsPerStep`) épuisé ou boucle détectée → un
+  dernier appel court oblige l'IA à choisir entre « impossible, avec preuve » (→ règle
+  de la preuve) et « je n'y arrive pas » (→ `inconclusive`).
+- **Juge séparé** : les critères `expect` sont vérifiés par un appel distinct (capture +
+  texte de la page). L'agent qui a agi ne se note pas lui-même.
+
+```ts
+for (const [i, step] of scenario.steps.entries()) {
+  for (let turn = 0; turn < config.agent.maxActionsPerStep; turn++) {
+    const page = await stableSnapshot();
+    const call = await llm(buildPrompt(scenario, journal, i, page),
+                           { tools: { ...browserTools, regarder_ecran, etape_reussie, etape_impossible } });
+
+    if (call.name === "etape_reussie") { journal.done(i, call.args.resume); break; }
+    if (call.name === "etape_impossible")
+      return pageContains(page, call.args.preuve) ? failed(i, call.args) : inconclusive(i, "preuve introuvable");
+
+    const out = await execute(call, { injectSecrets: true });
+    journal.add(i, describe(call, out));               // une ligne, secrets masqués
+    if (isLooping(journal, i)) break;
+  }
+  if (!journal.isDone(i)) return await finalReview(i); // → failed (preuve trouvée) ou inconclusive
+}
+return judge(scenario.expect, await stableSnapshot(), await screenshot());
+```
 
 ### Secrets jamais envoyés au LLM
 
@@ -258,11 +364,11 @@ Ce que fait l'Action :
 3. génère `report.json` + `report.html`, les publie en artefact du workflow ;
 4. poste **ou met à jour** un commentaire unique sur la PR (tableau des scénarios, étape en
    échec, raison, lien vers l'artefact) ;
-5. sort en code ≠ 0 si au moins un scénario est `failed` (configurable pour `error`).
+5. sort en code ≠ 0 selon les règles `ci` de `agentic-test.ts` (par défaut : au moins un `failed` ou un `inconclusive` après relance).
 
 Exemple de commentaire PR :
 
-> **Agentic E2E** — 4 scénarios · 3 ✅ · 1 ❌ · 0 ⚠️ · 2 min 41 · ~68k tokens
+> **Agentic E2E** — 4 scénarios · 3 ✅ · 1 ❌ · 0 🟠 · 0 ⚠️ · 2 min 41 · ~68k tokens
 >
 > | Scénario | Résultat | Détail |
 > |---|---|---|
@@ -402,6 +508,8 @@ petit/peu cher), sur l'app saine **et** sur l'app avec bug injecté.
 | Taux de vrais positifs (passe sur app saine) | fiabilité |
 | Taux de vrais négatifs (échoue sur app buguée) | le test sert à quelque chose |
 | Variance entre les 10 runs | flakiness intrinsèque |
+| Taux d'`inconclusive` | l'agent se perd-il souvent ? |
+| Tokens : message reconstruit vs conversation complète (Playwright MCP) | valider le choix de la boucle (§4) |
 | Durée médiane | expérience CI |
 | Tokens / coût moyen par scénario | argument BYOK |
 | Possibilité d'extraire les actions Playwright résolues | futur cache/replay |
