@@ -37,7 +37,8 @@ Le périmètre MVP du brief (§7) = **J0 + J1 + J2**. J0 seul est le « jalon z�
 
 ### Hors MVP (confirmé)
 Cache/replay sans LLM, détection de flaky, runner Docker générique, GitLab CI,
-runners managés, export vers bucket client, **diagnostic et correctif automatique
+runners managés, export vers bucket client, outils e-mail et double authentification
+(J1–J2, §4), outils définis par le client, **diagnostic et correctif automatique
 en cas d'échec** (§12). Mais **le format de rapport doit déjà contenir ce qu'il faudra
 pour ces fonctions** (actions résolues par étape, historique par scénario, erreurs
 console et réseau) — voir §3.
@@ -90,8 +91,11 @@ expect:
     - do: Valider le formulaire sans remplir l'email
       expect: Un message d'erreur indique que l'email est obligatoire
   ```
-- Variables : `{{vars.X}}` (valeurs non sensibles, visibles dans le rapport) et
-  `{{secrets.X}}` (lues dans l'env du runner, jamais affichées, jamais envoyées au LLM).
+- Variables : `{{vars.X}}` (valeurs non sensibles, visibles dans le rapport),
+  `{{secrets.X}}` (lues dans l'env du runner, jamais affichées, jamais envoyées au LLM :
+  l'agent les saisit via l'outil `remplir_secret`) et `{{memo.X}}` (valeur notée par
+  l'agent plus tôt dans le scénario avec l'outil `memoriser`, ex. un numéro de commande).
+- Fichiers à envoyer dans un formulaire (CV, photo…) : uniquement depuis `.agentic/fixtures/`.
 - Pas de `if`, pas de boucles, pas d'import en MVP. Un scénario = un parcours linéaire.
 
 ### Fichier de configuration : `agentic-test.ts`
@@ -126,6 +130,11 @@ export default defineConfig({
     inconclusiveThreshold: 1,                  // CI rouge à partir de N scénarios `inconclusive` ; false = jamais
     errorThreshold: false,                     // idem pour `error` ; false = avertissement seulement
   },
+
+  allowedDomains: ["staging.example.com", "checkout.stripe.com"],  // navigation limitée à ces domaines
+
+  setup: async ({ request }) => { /* préparer les données de test, voir §4 */ },
+  teardown: async ({ request }) => { /* nettoyer */ },
 
   judge: {
     model: undefined,                          // optionnel : un modèle plus solide que l'agent (défaut : `model`)
@@ -277,8 +286,9 @@ jouent le coût et la fiabilité.
 - C'est l'approche retenue par défaut ; le benchmark la compare à la conversation
   complète pour **chiffrer le gain** et vérifier qu'elle ne dégrade pas la fiabilité (§8).
 
-**2. Outils donnés à l'IA** : ceux de Playwright MCP (cliquer, remplir, naviguer…), plus :
-- `regarder_ecran` : capture d'écran **à la demande** seulement (une image coûte cher) ;
+**2. Outils donnés à l'IA** : ceux de Playwright MCP, filtrés, plus nos outils maison
+(liste complète dans « Outils de l'agent » ci-dessous). Parmi eux, les outils de contrôle
+de la boucle :
 - `etape_reussie(resume)` : termine l'étape en cours ;
 - `etape_impossible(raison, preuve)` : déclare l'étape irréalisable, **en citant un
   texte visible** dans la page (« Stock épuisé », « aucun bouton "Ajouter au panier" »).
@@ -303,7 +313,7 @@ for (const [i, step] of scenario.steps.entries()) {
   for (let turn = 0; turn < config.agent.maxActionsPerStep; turn++) {
     const page = await stableSnapshot();
     const call = await llm(buildPrompt(scenario, journal, i, page),
-                           { tools: { ...browserTools, regarder_ecran, etape_reussie, etape_impossible } });
+                           { tools: { ...filteredMcpTools, ...ourTools } });
 
     if (call.name === "etape_reussie") { journal.done(i, call.args.resume); break; }
     if (call.name === "etape_impossible")
@@ -367,14 +377,107 @@ abordable car le juge est appelé peu de fois) et `judge.votes`. Si le benchmark
 que le regroupement des critères dégrade la fiabilité, on ajoutera
 `judge.groupExpectations: false` (un appel par critère).
 
+### Outils de l'agent
+
+**Deux sources, une seule liste pour l'IA.** À chaque tour, l'API du LLM reçoit une liste
+d'outils (nom, description, paramètres) ; elle ne sait pas d'où ils viennent et n'exécute
+rien elle-même. C'est **notre boucle** qui aiguille chaque appel :
+- vers le **serveur Playwright MCP** (notre boucle en est le client MCP, comme le serait
+  Claude Desktop) pour les outils navigateur ;
+- vers une **simple fonction TypeScript** du runner pour nos outils maison.
+
+**Un seul serveur MCP (Playwright), et c'est la boucle qui s'y connecte, pas le LLM.**
+Nos outils maison ne sont pas exposés en MCP : MCP sert à ajouter des outils à une
+application qu'on ne contrôle pas ; ici on écrit la boucle. (Les API qui appellent
+elles-mêmes un serveur MCP distant ne conviennent pas : navigateur dans la CI du client,
+non joignable depuis Internet, et pas disponible chez tous les fournisseurs.)
+
+```ts
+const tools = {
+  ...filter(await playwrightMcp.tools()),     // outils du serveur MCP, filtrés
+  remplir_secret: tool({                      // outil maison : une simple fonction
+    description: "Remplit un champ avec un secret, sans jamais en voir la valeur",
+    parameters: z.object({ ref: z.string(), secret: z.string() }),
+    execute: async ({ ref, secret }) => { /* appelle l'outil « remplir » de MCP avec la vraie valeur */ },
+  }),
+  memoriser: tool({ /* ... */ }),
+  // ...
+};
+```
+
+Règle d'ajout : un outil maison ne se justifie que si Playwright MCP ne sait pas le
+faire, si l'IA le ferait mal ou cher, ou si la sécurité l'exige. Le moins possible :
+chaque description d'outil coûte des tokens à chaque tour, et trop d'outils font hésiter l'IA.
+
+**Outils maison dès J0** :
+
+| Outil | Rôle | Implémentation |
+|---|---|---|
+| `etape_reussie(resume)` / `etape_impossible(raison, preuve)` | Contrôle de la boucle (voir plus haut) | Code pur |
+| `regarder_ecran()` | Capture d'écran **à la demande** (une image coûte cher) | Outil capture de Playwright MCP |
+| `remplir_secret(ref, secret)` | L'IA désigne le champ et le *nom* du secret ; notre code appelle lui-même l'outil « remplir » de Playwright MCP avec la vraie valeur, puis masque la valeur dans le retour | Via Playwright MCP |
+| `attendre_texte(texte, max_secondes)` | Traitements lents (« Votre export est prêt ») sans relire la page à coups d'appels LLM | Playwright MCP semble proposer un outil d'attente de texte : **si oui, on l'utilise tel quel** (à vérifier au benchmark) |
+| `memoriser(nom, valeur)` | Noter une valeur (n° de commande…) réutilisable plus loin via `{{memo.nom}}`. Complément direct du message reconstruit : l'IA ne voit plus les anciennes pages, mais ce qu'elle a mémorisé reste dans le journal | Code pur |
+
+Conséquence : **en J0, aucun outil maison ne pilote le navigateur directement** ; ils
+passent par Playwright MCP ou n'en ont pas besoin. Pas de navigateur à partager entre
+le serveur MCP et notre code.
+
+**Outils Playwright MCP retirés ou bridés dès J0** (filtrage de la liste avant envoi à l'IA) :
+- **exécution de JavaScript dans la page** : retirée. L'agent pourrait « tricher »
+  (modifier le total affiché pour passer le test), et un texte piégé dans la page
+  pourrait lui faire exécuter du code ;
+- **navigation** : contrôlée par la boucle avant chaque appel, uniquement vers
+  `allowedDomains` (`agentic-test.ts`). Empêche une page piégée d'envoyer l'agent
+  coller des données ailleurs ;
+- **envoi de fichiers** : chemins limités à `.agentic/fixtures/` ;
+- outils inutiles pour nous (installer ou fermer le navigateur…) : retirés.
+
+**Plus tard (J1–J2)** — outils maison sans navigateur :
+- `lire_dernier_email(destinataire, filtre)` → sujet, texte, liens. Pour inscription,
+  mot de passe oublié, lien magique. Boîte de test fournie par le client : Mailpit dans
+  la CI, service type Mailosaur / MailSlurp avec sa clé, ou IMAP. Accompagné d'une
+  variable `{{email_unique}}` (adresse neuve à chaque run).
+- `code_double_authentification(secret)` → code TOTP à 6 chiffres calculé depuis un
+  secret du client. SMS hors périmètre.
+
+**Plus tard encore** :
+- outils définis par le client dans `agentic-test.ts` (ex. `creer_commande_de_test`) ;
+- un serveur MCP **à nous**, seulement pour permettre à d'autres agents (Claude Code,
+  Cursor…) de lancer nos scénarios (« lance le scénario de paiement et dis-moi pourquoi
+  il échoue »). Fonction produit, sans rapport avec le fonctionnement du runner.
+
+### Préparation des données : `setup` / `teardown` (J0)
+
+Préparer les données de test (créer un utilisateur, vider un panier, remettre la base à
+zéro) n'est **pas** confié à l'IA : lent, cher, peu fiable. C'est du code du client,
+dans `agentic-test.ts` :
+
+```ts
+export default defineConfig({
+  // ...
+  setup: async ({ request, scenario }) => {          // avant chaque scénario
+    await request.post("/api/test/reset", { headers: { "x-test-key": process.env.RESET_KEY! } });
+  },
+  teardown: async ({ request, scenario, result }) => { /* après chaque scénario, même en échec */ },
+});
+```
+
+- `request` : client HTTP Playwright déjà configuré sur `baseUrl`.
+- Exécuté dans la CI du client : pas de risque de sécurité supplémentaire pour nous.
+- Un `setup` qui plante → scénario en `error` avec le message du client (pas `failed` :
+  l'app n'a pas été testée). Un `teardown` qui plante → avertissement dans le rapport.
+- Règle la première cause de tests instables : des données de départ qui changent.
+- Variante globale (`globalSetup` / `globalTeardown`, une fois par run) : même principe,
+  à ajouter si le besoin apparaît.
+
 ### Secrets jamais envoyés au LLM
 
-Le LLM voit `{{secrets.TEST_USER_PASSWORD}}` (ou un placeholder équivalent) ; la valeur
-réelle n'est injectée qu'au moment où l'action `fill` est exécutée par Playwright.
-Stagehand propose un mécanisme de variables pour cela — **à vérifier** pour la version
-retenue et pour Midscene pendant le benchmark ; à défaut, on l'implémente dans le driver.
-Avec Playwright MCP, c'est forcément à nous : la boucle remplace le placeholder par la
-valeur juste avant d'exécuter l'outil `fill`, et masque la valeur dans tout ce qui revient au LLM.
+Le LLM ne voit que le **nom** du secret (`{{secrets.TEST_USER_PASSWORD}}`). La valeur
+n'est utilisée que par l'outil `remplir_secret`, qui la transmet directement à Playwright,
+et la boucle la masque dans tout ce qui revient au LLM et dans le rapport.
+Pour Stagehand et Midscene (benchmark), vérifier qu'ils offrent un mécanisme équivalent
+(Stagehand propose des variables — **à vérifier**) ; à défaut, on l'implémente dans le driver.
 
 ### Multi-provider LLM
 
