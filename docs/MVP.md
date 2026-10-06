@@ -82,8 +82,8 @@ expect:
 
 - `steps` : liste ordonnée d'instructions. Chaque étape est exécutée et reportée séparément
   (c'est ce qui permet d'afficher « étape en échec : 3 »).
-- `expect` : assertions vérifiées **à la fin** par un appel LLM dédié (capture + texte
-  de la page), qui doit répondre `true/false` + justification. Une étape peut aussi
+- `expect` : assertions vérifiées **à la fin** par le juge (§4, « Juge »), qui répond
+  vrai / faux / indéterminable en citant une preuve tirée de la page. Une étape peut aussi
   porter un `expect` local :
   ```yaml
   steps:
@@ -125,6 +125,11 @@ export default defineConfig({
     failOnFailed: true,                        // au moins un `failed` → CI rouge
     inconclusiveThreshold: 1,                  // CI rouge à partir de N scénarios `inconclusive` ; false = jamais
     errorThreshold: false,                     // idem pour `error` ; false = avertissement seulement
+  },
+
+  judge: {
+    model: undefined,                          // optionnel : un modèle plus solide que l'agent (défaut : `model`)
+    votes: 1,                                  // 3 = trois avis indépendants ; s'ils divergent → inconclusive
   },
 
   artifacts: { video: "on-failure", trace: "on-failure", screenshots: "every-step" },
@@ -290,8 +295,8 @@ jouent le coût et la fiabilité.
 - **Bilan forcé** : budget (`agent.maxActionsPerStep`) épuisé ou boucle détectée → un
   dernier appel court oblige l'IA à choisir entre « impossible, avec preuve » (→ règle
   de la preuve) et « je n'y arrive pas » (→ `inconclusive`).
-- **Juge séparé** : les critères `expect` sont vérifiés par un appel distinct (capture +
-  texte de la page). L'agent qui a agi ne se note pas lui-même.
+- **Juge séparé** : les critères `expect` sont vérifiés par un appel distinct (voir
+  « Juge » ci-dessous). L'agent qui a agi ne se note pas lui-même.
 
 ```ts
 for (const [i, step] of scenario.steps.entries()) {
@@ -312,6 +317,55 @@ for (const [i, step] of scenario.steps.entries()) {
 }
 return judge(scenario.expect, await stableSnapshot(), await screenshot());
 ```
+
+### Juge
+
+Le juge décide si un critère `expect` est rempli. Ses deux erreurs possibles n'ont pas
+le même coût : un **faux vert** (dit OK alors que le site est cassé) rend le test
+inutile sans que personne ne s'en aperçoive ; un **faux rouge** fait perdre confiance.
+L'objectif n°1 est **zéro faux vert**.
+
+**Ce qu'il reçoit** : le texte de la page entière (pas seulement la partie visible),
+une capture de la page entière, l'URL. **Pas le journal de l'agent** : il juge la page,
+pas ce que l'agent affirme avoir fait.
+
+**Nombre d'appels** : un appel par *moment* de vérification, pas par critère.
+- Tous les `expect` de fin de scénario sont jugés **ensemble, en un seul appel** (même
+  page, envoyée une fois), avec une réponse et une preuve par critère.
+- Chaque `expect` attaché à une étape donne un appel, juste après `etape_reussie`. S'il est
+  faux, le scénario s'arrête en `failed` à cette étape.
+- `judge.votes: 3` multiplie le tout par 3.
+
+**Réponse imposée, par critère** :
+
+```jsonc
+{
+  "critere": "Le total affiché est 19,90 €",
+  "verdict": "faux",                       // vrai | faux | indeterminable
+  "valeur_attendue": "19,90 €",
+  "valeur_observee": "24,90 €",
+  "preuve": "Total TTC : 24,90 €",         // texte copié tel quel depuis la page
+  "raison": "Le total inclut 5 € de frais de port"
+}
+```
+
+**Contrôles faits par notre code, sans IA** :
+- **La preuve existe dans la page** ; sinon → `inconclusive` (le juge a inventé).
+- **Comparaison des valeurs** : si `valeur_attendue` et `valeur_observee` sont des nombres
+  ou des montants, le code les normalise (« 19,90 € » = « 19.90€ » = « 19,9 EUR ») et les
+  compare lui-même. Désaccord entre le code et le verdict du juge → `inconclusive`.
+  Principe : l'IA **repère** l'information, le code **compare**.
+- **Votes** (si `votes > 1`) : verdicts divergents → `inconclusive`.
+
+**Correspondance** : vrai (preuve trouvée) → `passed` ; faux (preuve trouvée) → `failed` ;
+indéterminable → `inconclusive`. La réponse « indéterminable » évite qu'un LLM forcé de
+choisir réponde « vrai » par défaut. Les consignes du juge lui demandent aussi de
+**chercher d'abord ce qui contredit le critère**, avant ce qui le confirme.
+
+**Réglages** (`agentic-test.ts`) : `judge.model` (un modèle plus solide que l'agent,
+abordable car le juge est appelé peu de fois) et `judge.votes`. Si le benchmark montre
+que le regroupement des critères dégrade la fiabilité, on ajoutera
+`judge.groupExpectations: false` (un appel par critère).
 
 ### Secrets jamais envoyés au LLM
 
@@ -380,6 +434,14 @@ Exemple de commentaire PR :
 **Anti-support dès J0** : le premier check du runner est un « preflight » (clé LLM valide ?
 `base_url` joignable ? scénarios valides selon le schéma ?) qui échoue avec un message
 actionnable avant de lancer quoi que ce soit.
+
+Le preflight **signale aussi les critères `expect` vagues**, qu'un juge ne peut pas
+vérifier de façon fiable (« la page fonctionne bien », « l'expérience est fluide »).
+Un appel LLM court, sans navigateur, vérifie que chaque critère décrit quelque chose
+d'**observable sur la page**, et sinon affiche un avertissement avec une suggestion :
+« Précisez ce qui doit être visible, par ex. "le message 'Commande confirmée' s'affiche" ».
+Avertissement seulement : le run n'est pas bloqué. Le résultat est mis en cache par
+`content_hash` du scénario pour ne pas repayer cet appel à chaque run.
 
 ---
 
@@ -514,6 +576,13 @@ petit/peu cher), sur l'app saine **et** sur l'app avec bug injecté.
 | Tokens / coût moyen par scénario | argument BYOK |
 | Possibilité d'extraire les actions Playwright résolues | futur cache/replay |
 | Support des variables/secrets non transmis au LLM | sécurité |
+
+**Évaluation du juge, à part** : grâce à l'app où l'on injecte des bugs, constituer une
+collection de cas (page, critère, bonne réponse connue) et mesurer :
+- le **taux de faux verts** (objectif : zéro — c'est le chiffre le plus important du produit) ;
+- le taux de faux rouges ;
+- critères groupés en un appel vs un appel par critère ;
+- l'apport réel de `judge.model` plus solide et de `judge.votes: 3`, rapporté à leur coût.
 
 Le livrable est un tableau dans `docs/benchmark.md` et un choix argumenté.
 
